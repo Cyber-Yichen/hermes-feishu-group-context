@@ -31,6 +31,7 @@ The central optimization is that ordinary unmentioned group chatter must not cal
 | `install.ps1` | Validates paths, backs up files, installs plugin, patches adapter, enables plugin, restarts gateway |
 | `README.md` | Human installation, usage, security, recovery, and troubleshooting guide |
 | `.env.example` | Placeholder-only environment reference; never add real values |
+| `LICENSE` | MIT license selected by the repository owner |
 
 ## Technology Stack
 

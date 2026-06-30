@@ -449,6 +449,7 @@ D:\env\hermes\hermes-agent\venv\Scripts\python.exe `
 .
 ├── .env.example
 ├── AGENTS.md
+├── LICENSE
 ├── README.md
 ├── install.ps1
 ├── plugin
@@ -470,6 +471,10 @@ D:\env\hermes\hermes-agent\venv\Scripts\python.exe `
 - 发送者在模型上下文中使用 ID 后缀区分，暂未自动解析群成员姓名；
 - Hermes 上游大幅修改 Feishu 适配器后，补丁插入点可能需要更新；
 - 纯 @ 只能读取消息发送之前的记录，不可能读取未来消息。
+
+## 许可证
+
+本项目采用 [MIT License](./LICENSE)。
 
 ## 项目状态
 
