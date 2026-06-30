@@ -1,0 +1,14 @@
+name: feishu-context-archive
+version: 1.1.0
+description: Archive all Feishu group messages locally and read a selected time range only when requested.
+author: Local
+provides_tools:
+  - feishu_group_history
+provides_hooks:
+  - feishu_group_message_received
+  - feishu_group_empty_mention
+provides_commands:
+  - group-context
+requires_env:
+  - FEISHU_APP_ID
+  - FEISHU_APP_SECRET
