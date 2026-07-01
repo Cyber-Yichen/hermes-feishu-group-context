@@ -16,10 +16,70 @@ from gateway.session_context import get_session_env
 from tools.registry import tool_error, tool_result
 
 
-DEFAULT_EMPTY_MENTION_CONTEXT_COUNT = 20
-MIN_EMPTY_MENTION_CONTEXT_COUNT = 1
-MAX_EMPTY_MENTION_CONTEXT_COUNT = 100
-DEFAULT_EMPTY_MENTION_MAX_CHARS = 24000
+DEFAULT_PURE_MENTION_CONTEXT_COUNT = 20
+DEFAULT_CONTENT_MENTION_CONTEXT_COUNT = 5
+DEFAULT_RETENTION_DAYS = 30
+MIN_CONTEXT_COUNT = 0
+MAX_CONTEXT_COUNT = 100
+MIN_RETENTION_DAYS = 0
+MAX_RETENTION_DAYS = 3650
+DEFAULT_CONTEXT_MAX_CHARS = 24000
+RETENTION_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+_LAST_RETENTION_CLEANUP_MS: dict[str, int] = {}
+_FOLLOW_UP_MARKERS = (
+    "上面",
+    "前面",
+    "刚才",
+    "之前",
+    "这个",
+    "那个",
+    "这些",
+    "那些",
+    "继续",
+    "接着",
+    "再来",
+    "然后",
+    "为什么",
+    "怎么",
+    "它",
+    "这件事",
+    "this",
+    "that",
+    "these",
+    "those",
+    "above",
+    "previous",
+    "continue",
+    "again",
+)
+_TOKEN_STOPWORDS = {
+    "什么",
+    "怎么",
+    "可以",
+    "一下",
+    "我们",
+    "你们",
+    "这个",
+    "那个",
+    "然后",
+    "还是",
+    "因为",
+    "所以",
+    "已经",
+    "现在",
+    "需要",
+    "帮我",
+    "please",
+    "could",
+    "would",
+    "should",
+    "about",
+    "with",
+    "from",
+    "that",
+    "this",
+}
 
 
 TOOL_SCHEMA = {
@@ -92,26 +152,108 @@ def _settings_path() -> Path:
     return path
 
 
+def _clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _default_settings() -> dict[str, Any]:
+    return {
+        "defaults": {
+            "pure_mention_count": DEFAULT_PURE_MENTION_CONTEXT_COUNT,
+            "content_mention_count": DEFAULT_CONTENT_MENTION_CONTEXT_COUNT,
+            "retention_days": DEFAULT_RETENTION_DAYS,
+        },
+        "groups": {},
+    }
+
+
+def _normalize_settings(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return _default_settings()
+
+    legacy_default = data.get("default_count", DEFAULT_PURE_MENTION_CONTEXT_COUNT)
+    raw_defaults = data.get("defaults")
+    if not isinstance(raw_defaults, dict):
+        raw_defaults = {}
+    defaults = {
+        "pure_mention_count": _clamped_int(
+            raw_defaults.get("pure_mention_count", legacy_default),
+            DEFAULT_PURE_MENTION_CONTEXT_COUNT,
+            MIN_CONTEXT_COUNT,
+            MAX_CONTEXT_COUNT,
+        ),
+        "content_mention_count": _clamped_int(
+            raw_defaults.get(
+                "content_mention_count",
+                DEFAULT_CONTENT_MENTION_CONTEXT_COUNT,
+            ),
+            DEFAULT_CONTENT_MENTION_CONTEXT_COUNT,
+            MIN_CONTEXT_COUNT,
+            MAX_CONTEXT_COUNT,
+        ),
+        "retention_days": _clamped_int(
+            raw_defaults.get("retention_days", DEFAULT_RETENTION_DAYS),
+            DEFAULT_RETENTION_DAYS,
+            MIN_RETENTION_DAYS,
+            MAX_RETENTION_DAYS,
+        ),
+    }
+
+    normalized_groups: dict[str, dict[str, int]] = {}
+    raw_groups = data.get("groups")
+    if isinstance(raw_groups, dict):
+        for chat_id, raw_group in raw_groups.items():
+            if not isinstance(raw_group, dict):
+                continue
+            legacy_count = raw_group.get("count", defaults["pure_mention_count"])
+            if raw_group.get("enabled") is False:
+                legacy_count = 0
+            normalized_groups[str(chat_id)] = {
+                "pure_mention_count": _clamped_int(
+                    raw_group.get("pure_mention_count", legacy_count),
+                    defaults["pure_mention_count"],
+                    MIN_CONTEXT_COUNT,
+                    MAX_CONTEXT_COUNT,
+                ),
+                "content_mention_count": _clamped_int(
+                    raw_group.get(
+                        "content_mention_count",
+                        defaults["content_mention_count"],
+                    ),
+                    defaults["content_mention_count"],
+                    MIN_CONTEXT_COUNT,
+                    MAX_CONTEXT_COUNT,
+                ),
+                "retention_days": _clamped_int(
+                    raw_group.get("retention_days", defaults["retention_days"]),
+                    defaults["retention_days"],
+                    MIN_RETENTION_DAYS,
+                    MAX_RETENTION_DAYS,
+                ),
+            }
+    return {"defaults": defaults, "groups": normalized_groups}
+
+
 def _load_settings() -> dict[str, Any]:
     path = _settings_path()
     if not path.exists():
-        return {"default_count": DEFAULT_EMPTY_MENTION_CONTEXT_COUNT, "groups": {}}
+        return _default_settings()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"default_count": DEFAULT_EMPTY_MENTION_CONTEXT_COUNT, "groups": {}}
-    if not isinstance(data, dict):
-        return {"default_count": DEFAULT_EMPTY_MENTION_CONTEXT_COUNT, "groups": {}}
-    if not isinstance(data.get("groups"), dict):
-        data["groups"] = {}
-    return data
+        return _default_settings()
+    return _normalize_settings(data)
 
 
 def _save_settings(settings: dict[str, Any]) -> None:
     path = _settings_path()
     temporary = path.with_suffix(".tmp")
     temporary.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(_normalize_settings(settings), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     temporary.replace(path)
@@ -119,25 +261,26 @@ def _save_settings(settings: dict[str, Any]) -> None:
 
 def _group_settings(chat_id: str) -> dict[str, Any]:
     settings = _load_settings()
-    default_count = settings.get("default_count", DEFAULT_EMPTY_MENTION_CONTEXT_COUNT)
-    try:
-        default_count = int(default_count)
-    except (TypeError, ValueError):
-        default_count = DEFAULT_EMPTY_MENTION_CONTEXT_COUNT
-    default_count = max(
-        MIN_EMPTY_MENTION_CONTEXT_COUNT,
-        min(MAX_EMPTY_MENTION_CONTEXT_COUNT, default_count),
-    )
+    defaults = settings["defaults"]
     group = (settings.get("groups") or {}).get(chat_id) or {}
-    try:
-        count = int(group.get("count", default_count))
-    except (TypeError, ValueError):
-        count = default_count
     return {
-        "enabled": bool(group.get("enabled", True)),
-        "count": max(
-            MIN_EMPTY_MENTION_CONTEXT_COUNT,
-            min(MAX_EMPTY_MENTION_CONTEXT_COUNT, count),
+        "pure_mention_count": _clamped_int(
+            group.get("pure_mention_count", defaults["pure_mention_count"]),
+            defaults["pure_mention_count"],
+            MIN_CONTEXT_COUNT,
+            MAX_CONTEXT_COUNT,
+        ),
+        "content_mention_count": _clamped_int(
+            group.get("content_mention_count", defaults["content_mention_count"]),
+            defaults["content_mention_count"],
+            MIN_CONTEXT_COUNT,
+            MAX_CONTEXT_COUNT,
+        ),
+        "retention_days": _clamped_int(
+            group.get("retention_days", defaults["retention_days"]),
+            defaults["retention_days"],
+            MIN_RETENTION_DAYS,
+            MAX_RETENTION_DAYS,
         ),
     }
 
@@ -157,10 +300,20 @@ def _connect() -> sqlite3.Connection:
             msg_type TEXT NOT NULL,
             raw_content TEXT NOT NULL,
             create_time_ms INTEGER NOT NULL,
-            archived_at TEXT NOT NULL
+            archived_at TEXT NOT NULL,
+            mentions_bot INTEGER NOT NULL DEFAULT 0
         )
         """
     )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if "mentions_bot" not in columns:
+        conn.execute(
+            "ALTER TABLE messages "
+            "ADD COLUMN mentions_bot INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_chat_time "
         "ON messages(chat_id, create_time_ms)"
@@ -176,27 +329,57 @@ def _coerce_time_ms(value: Any) -> int:
     return raw if raw > 10_000_000_000 else raw * 1000
 
 
+def _prune_expired_messages(
+    chat_id: str,
+    retention_days: int,
+    *,
+    now_ms: int | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    if retention_days == 0:
+        return 0
+    current_ms = now_ms or int(datetime.now().timestamp() * 1000)
+    cutoff_ms = current_ms - retention_days * 24 * 60 * 60 * 1000
+
+    def delete(connection: sqlite3.Connection) -> int:
+        cursor = connection.execute(
+            "DELETE FROM messages WHERE chat_id = ? AND create_time_ms < ?",
+            (chat_id, cutoff_ms),
+        )
+        return max(0, int(cursor.rowcount))
+
+    if conn is not None:
+        return delete(conn)
+    with closing(_connect()) as owned_conn:
+        deleted = delete(owned_conn)
+        owned_conn.commit()
+        return deleted
+
+
 def _archive_group_message(**event: Any) -> None:
     chat_id = str(event.get("chat_id") or "").strip()
     message_id = str(event.get("message_id") or "").strip()
     if not chat_id.startswith("oc_") or not message_id:
         return
 
+    settings = _group_settings(chat_id)
+    now_ms = int(datetime.now().timestamp() * 1000)
     try:
         with closing(_connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO messages (
                     message_id, chat_id, thread_id, sender_id, sender_type,
-                    msg_type, raw_content, create_time_ms, archived_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    msg_type, raw_content, create_time_ms, archived_at, mentions_bot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(message_id) DO UPDATE SET
                     thread_id=excluded.thread_id,
                     sender_id=excluded.sender_id,
                     sender_type=excluded.sender_type,
                     msg_type=excluded.msg_type,
                     raw_content=excluded.raw_content,
-                    create_time_ms=excluded.create_time_ms
+                    create_time_ms=excluded.create_time_ms,
+                    mentions_bot=excluded.mentions_bot
                 """,
                 (
                     message_id,
@@ -208,8 +391,21 @@ def _archive_group_message(**event: Any) -> None:
                     str(event.get("raw_content") or ""),
                     _coerce_time_ms(event.get("create_time")),
                     datetime.now().astimezone().isoformat(),
+                    1 if event.get("mentions_bot") else 0,
                 ),
             )
+            last_cleanup_ms = _LAST_RETENTION_CLEANUP_MS.get(chat_id, 0)
+            if (
+                settings["retention_days"] > 0
+                and now_ms - last_cleanup_ms >= RETENTION_CLEANUP_INTERVAL_MS
+            ):
+                _prune_expired_messages(
+                    chat_id,
+                    settings["retention_days"],
+                    now_ms=now_ms,
+                    conn=conn,
+                )
+                _LAST_RETENTION_CLEANUP_MS[chat_id] = now_ms
             conn.commit()
     except sqlite3.Error:
         # Archiving must never interrupt inbound message handling.
@@ -268,8 +464,8 @@ def _recent_group_context(
     *,
     limit: int,
     exclude_message_id: str = "",
-    max_chars: int = DEFAULT_EMPTY_MENTION_MAX_CHARS,
-) -> list[str]:
+    max_chars: int = DEFAULT_CONTEXT_MAX_CHARS,
+) -> list[dict[str, Any]]:
     clauses = ["chat_id = ?"]
     params: list[Any] = [chat_id]
     if exclude_message_id:
@@ -280,7 +476,8 @@ def _recent_group_context(
     with closing(_connect()) as conn:
         rows = conn.execute(
             f"""
-            SELECT sender_id, sender_type, msg_type, raw_content, create_time_ms
+            SELECT sender_id, sender_type, msg_type, raw_content,
+                   create_time_ms, mentions_bot
             FROM messages
             WHERE {' AND '.join(clauses)}
             ORDER BY create_time_ms DESC
@@ -290,19 +487,68 @@ def _recent_group_context(
         ).fetchall()
 
     rows.reverse()
-    lines: list[str] = []
+    context_rows: list[dict[str, Any]] = []
     used_chars = 0
     tz = _timezone()
-    for sender_id, sender_type, msg_type, raw_content, create_time_ms in rows:
+    for (
+        sender_id,
+        sender_type,
+        msg_type,
+        raw_content,
+        create_time_ms,
+        mentions_bot,
+    ) in rows:
         text = _message_text(str(msg_type), str(raw_content))[:2000]
         sender_label = f"{sender_type or 'user'}:{str(sender_id or 'unknown')[-8:]}"
         timestamp = datetime.fromtimestamp(create_time_ms / 1000, tz=tz)
         line = f"[{timestamp:%Y-%m-%d %H:%M}] {sender_label}: {text}"
         if used_chars + len(line) > max_chars:
             break
-        lines.append(line)
+        context_rows.append(
+            {
+                "text": text,
+                "line": line,
+                "mentions_bot": bool(mentions_bot),
+            }
+        )
         used_chars += len(line) + 1
-    return lines
+    return context_rows
+
+
+def _context_tokens(text: str) -> set[str]:
+    lowered = text.casefold()
+    tokens = {
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9_.:/-]{2,}", lowered)
+        if token not in _TOKEN_STOPWORDS
+    }
+    for chunk in re.findall(r"[\u3400-\u9fff]{2,}", lowered):
+        if chunk not in _TOKEN_STOPWORDS and len(chunk) <= 8:
+            tokens.add(chunk)
+        for size in (2, 3):
+            for index in range(max(0, len(chunk) - size + 1)):
+                token = chunk[index : index + size]
+                if token not in _TOKEN_STOPWORDS:
+                    tokens.add(token)
+    return tokens
+
+
+def _context_is_obviously_related(
+    current_text: str,
+    rows: list[dict[str, Any]],
+) -> bool:
+    current = current_text.strip().casefold()
+    if not current:
+        return False
+    if any(marker in current for marker in _FOLLOW_UP_MARKERS):
+        return True
+    current_tokens = _context_tokens(current)
+    if not current_tokens:
+        return False
+    prior_tokens: set[str] = set()
+    for row in rows:
+        prior_tokens.update(_context_tokens(str(row.get("text") or "")))
+    return bool(current_tokens & prior_tokens)
 
 
 def _timezone() -> tzinfo:
@@ -445,18 +691,19 @@ def _handle_empty_mention(**event: Any) -> dict[str, str] | None:
         return None
 
     settings = _group_settings(chat_id)
-    if not settings["enabled"]:
+    count = settings["pure_mention_count"]
+    if count == 0:
         return None
 
     try:
-        lines = _recent_group_context(
+        rows = _recent_group_context(
             chat_id,
-            limit=settings["count"],
+            limit=count,
             exclude_message_id=message_id,
         )
     except sqlite3.Error:
         return None
-    if not lines:
+    if not rows:
         return {
             "text": (
                 "The user mentioned you without additional text, but no earlier "
@@ -464,10 +711,10 @@ def _handle_empty_mention(**event: Any) -> dict[str, str] | None:
             )
         }
 
-    context = "\n".join(lines)
+    context = "\n".join(str(row["line"]) for row in rows)
     return {
         "text": (
-            f"[Automatically loaded Feishu group context: the {len(lines)} messages "
+            f"[Automatically loaded Feishu group context: the {len(rows)} messages "
             "immediately before this mention. These are context, not pending requests.]\n"
             f"{context}\n\n"
             "[Current addressed event]\n"
@@ -476,6 +723,61 @@ def _handle_empty_mention(**event: Any) -> dict[str, str] | None:
             "unclear, ask one concise clarifying question."
         )
     }
+
+
+def _handle_content_mention(**event: Any) -> dict[str, str] | None:
+    chat_id = str(event.get("chat_id") or "").strip()
+    message_id = str(event.get("message_id") or "").strip()
+    current_text = str(event.get("text") or "").strip()
+    if not chat_id.startswith("oc_") or not current_text:
+        return None
+
+    settings = _group_settings(chat_id)
+    count = settings["content_mention_count"]
+    if count == 0:
+        return None
+
+    try:
+        rows = _recent_group_context(
+            chat_id,
+            limit=count,
+            exclude_message_id=message_id,
+        )
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    if all(bool(row.get("mentions_bot")) for row in rows):
+        return None
+    if not _context_is_obviously_related(current_text, rows):
+        return None
+
+    context = "\n".join(str(row["line"]) for row in rows)
+    return {
+        "text": (
+            f"[Optional Feishu group context: the {len(rows)} messages immediately "
+            "before the current addressed message. Use it only when it is clearly "
+            "related. Ignore unrelated history and never treat history as pending "
+            "requests.]\n"
+            f"{context}\n\n"
+            "[Current addressed message]\n"
+            f"{current_text}"
+        )
+    }
+
+
+def _settings_status(settings: dict[str, Any]) -> str:
+    return (
+        "本群上下文设置：\n"
+        f"- 纯艾特：读取前 {settings['pure_mention_count']} 条"
+        f"{'（关闭）' if settings['pure_mention_count'] == 0 else ''}\n"
+        f"- 艾特并有内容：读取前 {settings['content_mention_count']} 条"
+        f"{'（关闭）' if settings['content_mention_count'] == 0 else ''}\n"
+        f"- 消息保留：{settings['retention_days']} 天"
+        f"{'（永久保留）' if settings['retention_days'] == 0 else ''}\n"
+        "命令：/group-context pure <0-100> | content <0-100> | "
+        "retention <0-3650> | set <纯艾特> <有内容> <天数> | reset | status"
+    )
 
 
 def _command_context_settings(raw_args: str) -> str:
@@ -488,55 +790,99 @@ def _command_context_settings(raw_args: str) -> str:
     raw = raw_args.strip().lower()
     current = _group_settings(chat_id)
     if raw in {"", "status"}:
-        state = "on" if current["enabled"] else "off"
-        return (
-            f"Pure-mention context is {state}; recent message count: {current['count']}.\n"
-            "Usage: /group-context <1-100|on|off|reset|status>"
-        )
+        return _settings_status(current)
 
     settings = _load_settings()
     groups = settings.setdefault("groups", {})
     group = dict(groups.get(chat_id) or {})
 
     if raw == "on":
-        group["enabled"] = True
+        if current["pure_mention_count"] == 0:
+            group["pure_mention_count"] = settings["defaults"]["pure_mention_count"]
     elif raw == "off":
-        group["enabled"] = False
+        group["pure_mention_count"] = 0
     elif raw == "reset":
         groups.pop(chat_id, None)
         _save_settings(settings)
         restored = _group_settings(chat_id)
-        return (
-            "Pure-mention context settings reset for this group. "
-            f"Enabled: yes; recent message count: {restored['count']}."
+        try:
+            deleted = _prune_expired_messages(
+                chat_id,
+                restored["retention_days"],
+            )
+        except sqlite3.Error:
+            deleted = 0
+        return "已恢复本群默认设置。\n" + _settings_status(restored) + (
+            f"\n已清理 {deleted} 条过期消息。" if deleted else ""
         )
     else:
-        value = raw[4:].strip() if raw.startswith("set ") else raw
-        try:
-            count = int(value)
-        except ValueError:
-            return "Usage: /group-context <1-100|on|off|reset|status>"
-        if not MIN_EMPTY_MENTION_CONTEXT_COUNT <= count <= MAX_EMPTY_MENTION_CONTEXT_COUNT:
-            return (
-                "Message count must be between "
-                f"{MIN_EMPTY_MENTION_CONTEXT_COUNT} and {MAX_EMPTY_MENTION_CONTEXT_COUNT}."
+        parts = raw.split()
+        if len(parts) == 1:
+            parts = ["pure", parts[0]]
+
+        field_aliases = {
+            "pure": "pure_mention_count",
+            "empty": "pure_mention_count",
+            "content": "content_mention_count",
+            "mention": "content_mention_count",
+            "retention": "retention_days",
+            "days": "retention_days",
+        }
+        if parts[0] == "set" and len(parts) == 4:
+            try:
+                pure_count, content_count, retention_days = map(int, parts[1:])
+            except ValueError:
+                return "set 的三个参数必须是整数。"
+            if not MIN_CONTEXT_COUNT <= pure_count <= MAX_CONTEXT_COUNT:
+                return "纯艾特消息数必须在 0 到 100 之间。"
+            if not MIN_CONTEXT_COUNT <= content_count <= MAX_CONTEXT_COUNT:
+                return "艾特并有内容消息数必须在 0 到 100 之间。"
+            if not MIN_RETENTION_DAYS <= retention_days <= MAX_RETENTION_DAYS:
+                return "消息保留天数必须在 0 到 3650 之间。"
+            group.update(
+                {
+                    "pure_mention_count": pure_count,
+                    "content_mention_count": content_count,
+                    "retention_days": retention_days,
+                }
             )
-        group["count"] = count
-        group["enabled"] = True
+        elif len(parts) == 2 and parts[0] in field_aliases:
+            field = field_aliases[parts[0]]
+            try:
+                value = int(parts[1])
+            except ValueError:
+                return "设置值必须是整数。"
+            if field == "retention_days":
+                if not MIN_RETENTION_DAYS <= value <= MAX_RETENTION_DAYS:
+                    return "消息保留天数必须在 0 到 3650 之间。"
+            elif not MIN_CONTEXT_COUNT <= value <= MAX_CONTEXT_COUNT:
+                return "上下文消息数必须在 0 到 100 之间。"
+            group[field] = value
+        else:
+            return _settings_status(current)
 
     groups[chat_id] = group
     _save_settings(settings)
     updated = _group_settings(chat_id)
-    state = "on" if updated["enabled"] else "off"
-    return (
-        f"Pure-mention context is now {state}; "
-        f"recent message count: {updated['count']}."
-    )
+    deleted = 0
+    if updated["retention_days"] > 0:
+        try:
+            deleted = _prune_expired_messages(chat_id, updated["retention_days"])
+            _LAST_RETENTION_CLEANUP_MS[chat_id] = int(
+                datetime.now().timestamp() * 1000
+            )
+        except sqlite3.Error:
+            deleted = 0
+    result = "设置已更新。\n" + _settings_status(updated)
+    if deleted:
+        result += f"\n已清理 {deleted} 条过期消息。"
+    return result
 
 
 def register(ctx: Any) -> None:
     ctx.register_hook("feishu_group_message_received", _archive_group_message)
     ctx.register_hook("feishu_group_empty_mention", _handle_empty_mention)
+    ctx.register_hook("feishu_group_content_mention", _handle_content_mention)
     ctx.register_tool(
         name="feishu_group_history",
         toolset="feishu-context-archive",
@@ -547,6 +893,6 @@ def register(ctx: Any) -> None:
     ctx.register_command(
         "group-context",
         handler=_command_context_settings,
-        description="Configure Feishu pure-mention context",
-        args_hint="<1-100|on|off|reset|status>",
+        description="Configure Feishu group context and archive retention",
+        args_hint="<pure|content|retention|set|reset|status>",
     )

@@ -12,6 +12,7 @@
 - 不希望每条群消息都触发 Agent 或消耗模型 Token；
 - 正常情况下，只有 `@机器人` 才应该回复；
 - 当群里只发送一个单独的 `@机器人` 时，希望它自动参考最近的聊天；
+- 当 `@机器人` 并附带问题时，只在近期消息明显相关时补充少量上下文；
 - 当用户要求“复盘今天聊了什么”时，只在这一次请求中读取指定范围的群聊记录。
 
 项目使用本地 SQLite 保存群消息。普通群消息不会被发送给模型，只有明确触发上下文功能时，选中的记录才会进入模型输入。
@@ -24,7 +25,7 @@
 | 场景 | 是否归档 | 是否调用模型 | 是否回复 |
 | --- | --- | --- | --- |
 | 群内普通消息，没有 @机器人 | 是 | 否 | 否 |
-| `@机器人` 并附带正常问题 | 是 | 是 | 是 |
+| `@机器人` 并附带正常问题 | 是 | 是，相关时附带最近 5 条 | 是 |
 | 只发送一个单独的 `@机器人` | 是 | 是，自动附带最近 N 条 | 是 |
 | `@机器人 复盘今天聊了什么` | 是 | 是，按需查询今天的归档 | 是 |
 | 私聊机器人 | 不属于本插件的群归档范围 | 由 Hermes 权限配置决定 | 由 Hermes 权限配置决定 |
@@ -36,7 +37,10 @@
 - 飞书历史消息 API 回填安装前的聊天记录；
 - 按今天、昨天、最近 N 小时或自定义时间范围读取；
 - 单独 @机器人时自动加载最近消息，默认 20 条；
-- 每个群可独立修改自动上下文条数；
+- @机器人并附带内容时，默认检查最近 5 条；无明显关联时不注入；
+- 若候选历史全部是 @机器人消息，则忽略历史并直接处理当前消息；
+- 每个群可独立修改两类自动上下文条数，`0` 表示关闭；
+- 默认删除 30 天前的本群归档，可设为 `0` 永久保留；
 - 不在普通请求中持续注入群聊历史；
 - 安装前自动备份 Hermes Feishu 适配器；
 - 补丁器可重复运行，不会重复插入代码。
@@ -53,7 +57,7 @@
 | Hermes Feishu Adapter | 接收消息事件、执行 @ 过滤、发送回复 | 由 Hermes Agent 提供 |
 | `lark-oapi` | Hermes 通过 WebSocket 接收飞书事件 | 由 Hermes Feishu 平台依赖提供 |
 | Feishu Open API | 获取访问令牌、回填群聊历史 | 使用飞书应用凭据，无需单独服务 |
-| JSON | 保存每个群的纯 @ 上下文设置 | 本地文件 |
+| JSON | 保存每个群的上下文条数和归档保留天数 | 本地文件 |
 
 项目**不需要**：
 
@@ -64,7 +68,7 @@
 - 常驻的额外 Web 服务；
 - 单独安装 Python 依赖。
 
-运行时主体仍然是 Hermes Gateway。本项目只是一个用户插件，加上两处受控的适配器 Hook。
+运行时主体仍然是 Hermes Gateway。本项目只是一个用户插件，加上三处受控的适配器 Hook。
 
 ## 工作原理
 
@@ -75,9 +79,12 @@ flowchart TD
     C --> D[("本地 SQLite")]
     B --> E{"是否 @机器人"}
     E -- "否" --> F["停止，不调用模型"]
-    E -- "是且包含文字" --> G["正常 Hermes 请求"]
+    E -- "是且包含文字" --> L["检查最近 5 条的关联性"]
+    L -- "相关且并非全部已 @" --> G["附带可选上下文"]
+    L -- "无关或全部已 @" --> M["直接处理当前消息"]
     E -- "只有一个纯 @" --> H["读取最近 N 条归档"]
     H --> G
+    M --> I
     G --> I["模型生成回复"]
     I --> J["发送到飞书群"]
     G -. "用户明确要求复盘" .-> K["feishu_group_history 工具"]
@@ -89,8 +96,9 @@ flowchart TD
 1. **Hermes 用户插件**
    - 监听 `feishu_group_message_received`，将群消息写入 SQLite；
    - 监听 `feishu_group_empty_mention`，处理纯 @；
+   - 监听 `feishu_group_content_mention`，处理 @并附带内容的相关上下文；
    - 提供 `feishu_group_history` 工具；
-   - 注册 `/group-context` 设置指令。
+   - 注册 `/group-context` 设置指令和过期消息清理。
 2. **适配器补丁**
    - 在 Hermes 丢弃非 @ 或空文本之前调用插件 Hook；
    - 不改动 Hermes 的模型、会话、发送消息和权限系统。
@@ -182,7 +190,7 @@ D:\env\hermes\hermes-agent\venv\Scripts\hermes.exe gateway status
 预期能看到：
 
 ```text
-enabled  user  1.1.0  feishu-context-archive
+enabled  user  1.2.0  feishu-context-archive
 ```
 
 ## 回填已有群聊记录
@@ -274,15 +282,17 @@ Hermes 会在需要时调用 `feishu_group_history` 工具。工具支持：
 - `recent`
 - `custom`
 
-## 修改纯 @ 设置
+## 修改上下文与保留设置
 
 设置按群保存。指令需要在群里 @机器人：
 
 ```text
 @机器人 /group-context
 @机器人 /group-context status
-@机器人 /group-context 30
-@机器人 /group-context set 30
+@机器人 /group-context pure 20
+@机器人 /group-context content 5
+@机器人 /group-context retention 30
+@机器人 /group-context set 20 5 30
 @机器人 /group-context off
 @机器人 /group-context on
 @机器人 /group-context reset
@@ -294,13 +304,20 @@ Hermes 会在需要时调用 `feishu_group_history` 工具。工具支持：
 | --- | --- |
 | `/group-context` | 查看当前群设置 |
 | `/group-context status` | 查看当前群设置 |
-| `/group-context 30` | 纯 @ 时读取最近 30 条 |
-| `/group-context set 30` | 与上一条相同 |
+| `/group-context pure 20` | 纯 @ 时读取最近 20 条 |
+| `/group-context content 5` | @并附带内容时最多读取最近 5 条 |
+| `/group-context retention 30` | 删除 30 天前的本群消息 |
+| `/group-context set 20 5 30` | 一次设置纯 @、有内容 @、保留天数 |
+| `/group-context 30` | 兼容旧语法，设置纯 @ 为 30 条 |
 | `/group-context off` | 关闭当前群的纯 @ 自动上下文 |
 | `/group-context on` | 重新开启 |
 | `/group-context reset` | 恢复默认值 |
 
-可设置范围为 1 到 100 条。
+两类上下文均可设置为 `0` 到 `100` 条，`0` 表示不读取。保留天数可设置为 `0` 到 `3650` 天，`0` 表示不自动删除。
+
+过期清理在新消息归档时每个群最多每 6 小时执行一次。修改保留天数或恢复默认设置时，会立即尝试清理当前群的过期记录。
+
+@并附带内容时，插件先执行轻量相关性判断。当前消息包含“上面”“刚才”“继续”等承接词，或与近期消息存在共同的中英文关键词时，才会注入上下文。若候选消息全部曾经 @机器人，则直接忽略历史。该判断用于降低无关 Token 消耗，不是语义检索模型。
 
 ## 数据与备份位置
 
@@ -310,7 +327,7 @@ Hermes 会在需要时调用 `feishu_group_history` 工具。工具支持：
 D:\env\hermes\archives\feishu_group_messages.sqlite3
 ```
 
-纯 @ 设置：
+群上下文与保留设置：
 
 ```text
 D:\env\hermes\archives\feishu_context_settings.json
@@ -374,7 +391,7 @@ D:\env\hermes\hermes-agent\venv\Scripts\hermes.exe gateway restart
 - 群聊记录保存在本机，不会由本插件上传到第三方服务；
 - 只有进入模型上下文的选定记录会发送给当前配置的模型服务；
 - SQLite 数据库当前不加密；
-- 当前没有自动过期或清理策略；
+- 默认自动删除 30 天前的记录；如需永久保留，必须显式把保留天数设为 `0`；
 - 不要提交 `.env`、数据库、备份、日志和真实群 ID；
 - 公开部署前，应向群成员说明消息归档行为；
 - 请通过磁盘权限、BitLocker 或其他系统级措施保护 Hermes 数据目录。
@@ -403,7 +420,7 @@ D:\env\hermes\hermes-agent\venv\Scripts\hermes.exe gateway restart
 若没有：
 
 - 重新运行 `install.ps1`；
-- 确认补丁器显示 `features=archive,empty_mention`；
+- 确认补丁器显示 `features=archive,archive_mention_flag,empty_mention,content_mention`；
 - 确认机器人身份能被 Hermes 正确识别；
 - 运行 `/group-context status` 检查是否被关闭。
 
@@ -432,6 +449,13 @@ D:\env\hermes\hermes-agent\venv\Scripts\python.exe -m py_compile `
   .\plugin\__init__.py `
   .\scripts\patch_adapter.py `
   .\scripts\backfill_history.py
+```
+
+功能测试：
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE = '1'
+D:\env\hermes\hermes-agent\venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 检查当前 Hermes 适配器是否可安装：
@@ -467,7 +491,7 @@ D:\env\hermes\hermes-agent\venv\Scripts\python.exe `
 - 当前安装脚本面向 Windows PowerShell；
 - 本地数据库未加密；
 - 没有可视化管理界面；
-- 没有自动数据保留期限；
+- 相关性判断是轻量关键词规则，可能忽略只有隐含语义关联的历史；
 - 发送者在模型上下文中使用 ID 后缀区分，暂未自动解析群成员姓名；
 - Hermes 上游大幅修改 Feishu 适配器后，补丁插入点可能需要更新；
 - 纯 @ 只能读取消息发送之前的记录，不可能读取未来消息。
@@ -478,6 +502,6 @@ D:\env\hermes\hermes-agent\venv\Scripts\python.exe `
 
 ## 项目状态
 
-当前插件版本：`1.1.0`
+当前插件版本：`1.2.0`
 
 本项目是社区扩展，不隶属于 NousResearch、Hermes Agent、飞书或字节跳动。

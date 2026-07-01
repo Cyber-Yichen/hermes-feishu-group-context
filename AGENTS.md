@@ -4,12 +4,14 @@ Read this file before changing code. `README.md` is the human-facing product and
 
 ## Project Purpose
 
-This repository extends Hermes Agent's Feishu/Lark platform with two independent capabilities:
+This repository extends Hermes Agent's Feishu/Lark platform with three capabilities:
 
 1. Archive every group message locally before Hermes applies mention gating.
 2. Inject archived context only when explicitly needed:
    - the user sends a pure bot mention with no other content; or
+   - an addressed message has content that is obviously related to recent chat; or
    - the model calls `feishu_group_history` for a requested recap or time range.
+3. Delete expired rows using a bounded, per-group retention policy.
 
 The central optimization is that ordinary unmentioned group chatter must not call the model or consume model tokens.
 
@@ -26,7 +28,8 @@ The central optimization is that ordinary unmentioned group chatter must not cal
 | --- | --- |
 | `plugin/__init__.py` | SQLite archive, settings, hooks, history tool, slash command |
 | `plugin/plugin.yaml` | Hermes plugin manifest and version |
-| `scripts/patch_adapter.py` | Idempotently inserts two Hook calls into the Hermes Feishu adapter |
+| `scripts/patch_adapter.py` | Idempotently inserts three Hook calls into the Hermes Feishu adapter |
+| `tests/test_plugin.py` | Unit tests for migration, filtering, commands, and retention |
 | `scripts/backfill_history.py` | Imports existing Feishu history through the official API |
 | `install.ps1` | Validates paths, backs up files, installs plugin, patches adapter, enables plugin, restarts gateway |
 | `README.md` | Human installation, usage, security, recovery, and troubleshooting guide |
@@ -84,6 +87,23 @@ There is intentionally no:
 6. Plugin returns synthetic context text.
 7. Hermes processes that text as the current addressed turn and replies.
 
+### Addressed message with content
+
+1. The regular archive Hook stores the message and whether it mentioned the bot.
+2. After self-mention stripping, the adapter invokes `feishu_group_content_mention`.
+3. A count of `0` skips context lookup.
+4. The plugin reads the configured number of preceding messages, excluding the current message.
+5. If every candidate row mentioned the bot, the plugin returns `None`.
+6. If lightweight keyword and follow-up-marker matching finds no obvious relationship, the plugin returns `None`.
+7. Otherwise, the plugin prepends optional context while preserving the current addressed text.
+
+### Retention cleanup
+
+1. Retention defaults to 30 days per group.
+2. A value of `0` disables automatic deletion.
+3. Archive writes opportunistically clean at most once per group every six hours.
+4. Changing retention through `/group-context` triggers an immediate cleanup attempt.
+
 ### Explicit recap request
 
 1. A normal addressed message enters Hermes.
@@ -97,17 +117,19 @@ There is intentionally no:
 Do not break these invariants:
 
 1. Unmentioned group messages are archived but never dispatched to the model.
-2. Normal addressed messages do not automatically receive the full archive.
+2. Normal addressed messages receive at most their configured small context window.
 3. Pure mentions use only messages preceding the mention.
-4. The current pure mention is excluded by `message_id`.
+4. Current messages are excluded from both context modes by `message_id`.
 5. Archive writes are idempotent by `message_id`.
 6. Archive failures must never crash inbound message handling.
-7. Missing or disabled pure-mention settings must fall back safely.
+7. A context count of zero disables only that context mode.
 8. Settings are scoped per Feishu `chat_id`.
 9. No real credentials, tokens, chat IDs, user IDs, logs, backups, or databases may be committed.
 10. Installer patching must remain idempotent.
 11. Existing unrelated Hermes adapter modifications must be preserved.
 12. Patch mismatch must fail with an actionable error. Never force a blind replacement.
+13. Retention zero must never delete archived rows.
+14. Old settings and databases must migrate in place without dropping messages.
 
 ## Plugin Contracts
 
@@ -126,6 +148,7 @@ sender_type: "user" | "bot"
 msg_type: str
 raw_content: str
 create_time: int | str | None
+mentions_bot: bool
 ```
 
 The callback returns `None`.
@@ -149,6 +172,23 @@ The callback returns one of:
 ```
 
 or `None` to preserve Hermes's normal empty-message drop behavior.
+
+### Hook: `feishu_group_content_mention`
+
+Called for a group text message that explicitly mentions the bot and still has
+non-command content after self-mention stripping.
+
+Expected keyword arguments:
+
+```text
+message_id: str
+chat_id: str
+thread_id: str
+text: str
+```
+
+The callback returns replacement text containing optional history and the
+unaltered current message, or `None` to process only the current message.
 
 ### Tool: `feishu_group_history`
 
@@ -177,8 +217,11 @@ Supported forms:
 ```text
 /group-context
 /group-context status
-/group-context <1-100>
-/group-context set <1-100>
+/group-context pure <0-100>
+/group-context content <0-100>
+/group-context retention <0-3650>
+/group-context set <pure> <content> <days>
+/group-context <0-100>
 /group-context on
 /group-context off
 /group-context reset
@@ -208,7 +251,8 @@ CREATE TABLE messages (
     msg_type TEXT NOT NULL,
     raw_content TEXT NOT NULL,
     create_time_ms INTEGER NOT NULL,
-    archived_at TEXT NOT NULL
+    archived_at TEXT NOT NULL,
+    mentions_bot INTEGER NOT NULL DEFAULT 0
 );
 ```
 
@@ -231,11 +275,16 @@ Shape:
 
 ```json
 {
-  "default_count": 20,
+  "defaults": {
+    "pure_mention_count": 20,
+    "content_mention_count": 5,
+    "retention_days": 30
+  },
   "groups": {
     "oc_example": {
-      "enabled": true,
-      "count": 30
+      "pure_mention_count": 30,
+      "content_mention_count": 5,
+      "retention_days": 30
     }
   }
 }
@@ -247,16 +296,18 @@ Settings writes use a temporary file followed by replacement. Preserve atomic wr
 
 ## Adapter Patch Rules
 
-`scripts/patch_adapter.py` inserts two independent blocks:
+`scripts/patch_adapter.py` inserts three independent blocks:
 
 1. Archive Hook before `self._admit(sender, message)`.
 2. Pure-mention Hook before the empty-text guard in `_process_inbound_message`.
+3. Addressed-content Hook before the same empty-text guard.
 
 Each block has a unique marker:
 
 ```text
 "feishu_group_message_received"
 "feishu_group_empty_mention"
+"feishu_group_content_mention"
 ```
 
 The patcher must:
@@ -325,24 +376,24 @@ Expected output is one of:
 
 ```text
 adapter_status=patchable missing=...
-adapter_status=already_patched features=archive,empty_mention
+adapter_status=already_patched features=archive,archive_mention_flag,empty_mention,content_mention
 ```
 
 ### Functional checks
 
 At minimum, validate:
 
-1. Archiving 25 synthetic messages produces 25 unique rows.
-2. Re-archiving the same `message_id` does not increase row count.
-3. Pure mention default context contains 20 preceding messages.
-4. The pure mention itself is excluded.
-5. `/group-context 7` changes the pure-mention context to 7 messages.
-6. `/group-context off` makes the empty-mention Hook return `None`.
-7. `feishu_group_history` rejects non-Feishu and DM sessions.
-8. `today`, `yesterday`, `last_hours`, and `custom` ranges use local timezone boundaries.
-9. Patched adapter parses as valid Python.
+1. Legacy settings migrate disabled pure mentions to a count of zero.
+2. Legacy databases gain `mentions_bot` without dropping rows.
+3. Related addressed messages receive the configured context window.
+4. Unrelated context and all-mentioned context are ignored.
+5. Both context modes return `None` when configured to zero.
+6. Retention 30 deletes rows older than 30 days.
+7. Retention zero deletes nothing.
+8. `/group-context set 20 5 30` updates all three values.
+9. Patched adapter parses as valid Python and each marker appears once.
 10. A real unmentioned group message increases the archive count without creating an Agent turn.
-11. A real pure mention logs context expansion and produces a Feishu bot response.
+11. Real pure and content mentions produce the expected Feishu responses.
 
 Use temporary `HERMES_HOME` paths for synthetic tests. Never modify a user's live archive during unit tests.
 
@@ -373,7 +424,7 @@ Before release:
 ## Known Limitations
 
 - Installer is Windows PowerShell oriented.
-- SQLite archive is unencrypted and has no retention policy.
+- SQLite archive is unencrypted; retention defaults to 30 days and is configurable.
 - Sender display uses ID suffixes, not resolved names.
 - Pure mentions cannot include future messages.
 - Major upstream Hermes Feishu adapter changes may require patch-point updates.

@@ -94,10 +94,20 @@ def connect_archive(path: Path) -> sqlite3.Connection:
             msg_type TEXT NOT NULL,
             raw_content TEXT NOT NULL,
             create_time_ms INTEGER NOT NULL,
-            archived_at TEXT NOT NULL
+            archived_at TEXT NOT NULL,
+            mentions_bot INTEGER NOT NULL DEFAULT 0
         )
         """
     )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if "mentions_bot" not in columns:
+        conn.execute(
+            "ALTER TABLE messages "
+            "ADD COLUMN mentions_bot INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_chat_time "
         "ON messages(chat_id, create_time_ms)"
